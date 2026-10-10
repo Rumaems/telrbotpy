@@ -3,7 +3,8 @@ import json
 import logging
 import os
 import re
-from itertools import cycle
+from dataclasses import dataclass
+from typing import List
 
 from dotenv import load_dotenv
 from openai import AsyncOpenAI, APIStatusError, RateLimitError
@@ -12,43 +13,65 @@ load_dotenv()
 
 log = logging.getLogger("flow-ai-kpc")
 
-# --- Поддержка нескольких ключей ---
-# Можно указать либо AI_API_KEYS=key1,key2,key3
-# либо старый способ AI_API_KEY=один_ключ
-_raw_keys = os.getenv("AI_API_KEYS") or os.getenv("AI_API_KEY") or ""
-API_KEYS = [k.strip() for k in _raw_keys.split(",") if k.strip()]
 
-if not API_KEYS:
-    raise RuntimeError("Не указан ни один ключ: задай AI_API_KEYS или AI_API_KEY")
+@dataclass
+class Provider:
+    name: str
+    client: AsyncOpenAI
+    model: str
 
-BASE_URL = os.getenv("AI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/")
-MODEL = os.getenv("AI_MODEL", "gemini-2.5-flash")
-FAST_MODEL = os.getenv("AI_FAST_MODEL", MODEL)
 
-# Создаём клиенты для каждого ключа
-_clients = [
-    AsyncOpenAI(api_key=key, base_url=BASE_URL)
-    for key in API_KEYS
-]
+def _load_providers() -> List[Provider]:
+    """
+    Формат AI_PROVIDERS:
+    name|api_key|base_url|model;name2|key2|base2|model2
+    """
+    raw = os.getenv("AI_PROVIDERS", "").strip()
+    providers: List[Provider] = []
 
-# Текущий индекс (начинаем с первого)
-_current_idx = 0
-_key_cycle = cycle(range(len(_clients)))  # на всякий случай
+    if raw:
+        for part in raw.split(";"):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                name, key, base_url, model = [x.strip() for x in part.split("|", 3)]
+                client = AsyncOpenAI(api_key=key, base_url=base_url)
+                providers.append(Provider(name=name, client=client, model=model))
+            except Exception as e:
+                log.error("Не удалось разобрать провайдера: %s (%s)", part, e)
 
-def _get_client() -> AsyncOpenAI:
-    return _clients[_current_idx]
+    # Запасной вариант (старый способ)
+    if not providers:
+        key = os.getenv("AI_API_KEY")
+        if not key:
+            raise RuntimeError("Не задан ни AI_PROVIDERS, ни AI_API_KEY")
+        base_url = os.getenv("AI_BASE_URL", "https://api.groq.com/openai/v1")
+        model = os.getenv("AI_MODEL", "openai/gpt-oss-120b")
+        client = AsyncOpenAI(api_key=key, base_url=base_url)
+        providers.append(Provider(name="default", client=client, model=model))
 
-def _switch_key(reason: str = ""):
-    """Переключаемся на следующий ключ."""
-    global _current_idx
-    old = _current_idx
-    _current_idx = (_current_idx + 1) % len(_clients)
-    log.warning(
-        "Переключаю ключ %s → %s%s",
-        old + 1,
-        _current_idx + 1,
-        f" ({reason})" if reason else "",
-    )
+    log.info("Загружено провайдеров: %s", [p.name for p in providers])
+    return providers
+
+
+PROVIDERS = _load_providers()
+CURRENT_IDX = 0
+
+FAST_MODEL = os.getenv("AI_FAST_MODEL", "openai/gpt-oss-20b")
+
+
+def _get_provider() -> Provider:
+    return PROVIDERS[CURRENT_IDX]
+
+
+def _switch_provider(reason: str = ""):
+    global CURRENT_IDX
+    old = PROVIDERS[CURRENT_IDX].name
+    CURRENT_IDX = (CURRENT_IDX + 1) % len(PROVIDERS)
+    new = PROVIDERS[CURRENT_IDX].name
+    log.warning("Переключаю провайдер: %s → %s %s", old, new, f"({reason})" if reason else "")
+
 
 SYSTEM = """Ты — {bot_name}, живой и естественный участник Telegram-чата.
 Разговаривай естественно: замечай контекст, помни собеседников, подхватывай темы,
@@ -77,20 +100,22 @@ SYSTEM = """Ты — {bot_name}, живой и естественный учас
 Сообщения вида [фото] и [стикер 😂] в истории — это то, что присылали люди."""
 
 
-def _system(bot_name):
+def _system(bot_name: str) -> str:
     return SYSTEM.replace("{bot_name}", bot_name)
 
 
-async def _complete(system, content, model, max_tokens=1500):
-    """Делает запрос. При rate-limit / 429 автоматически переключает ключ и пробует снова."""
+async def _complete(system: str, content, model: str | None = None, max_tokens: int = 1500) -> str:
+    """Делает запрос. При rate-limit переключается на следующий провайдер."""
     last_error = None
-    attempts = len(_clients)  # максимум по одному разу на каждый ключ
+    attempts = len(PROVIDERS)
 
-    for attempt in range(attempts):
-        client = _get_client()
+    for _ in range(attempts):
+        prov = _get_provider()
+        use_model = model or prov.model
+
         try:
-            response = await client.chat.completions.create(
-                model=model,
+            response = await prov.client.chat.completions.create(
+                model=use_model,
                 max_tokens=max_tokens,
                 messages=[
                     {"role": "system", "content": system},
@@ -100,29 +125,19 @@ async def _complete(system, content, model, max_tokens=1500):
             return (response.choices[0].message.content or "").strip()
 
         except (RateLimitError, APIStatusError) as e:
-            # 429 и похожие ошибки — переключаемся
             status = getattr(e, "status_code", None) or getattr(getattr(e, "response", None), "status_code", None)
-            if status == 429 or isinstance(e, RateLimitError):
-                last_error = e
-                _switch_key(f"rate limit / {status}")
-                continue
-            # другие ошибки API — тоже пробуем следующий ключ
             last_error = e
-            _switch_key(f"API error {status}")
+            _switch_provider(f"rate limit / {status}")
             continue
-
         except Exception as e:
-            # неизвестная ошибка — тоже пробуем следующий
             last_error = e
-            _switch_key(f"unexpected: {type(e).__name__}")
+            _switch_provider(f"error: {type(e).__name__}")
             continue
 
-    # Все ключи исчерпаны
-    raise RuntimeError(f"Все {len(_clients)} ключей недоступны. Последняя ошибка: {last_error}") from last_error
+    raise RuntimeError(f"Все провайдеры недоступны. Последняя ошибка: {last_error}") from last_error
 
 
 def _with_image(text, image):
-    """image = (bytes, media_type) или None."""
     if not image:
         return text
     data, media_type = image
@@ -147,7 +162,7 @@ NO — если сообщение служебное, слишком лично
 
 ПОСЛЕДНЕЕ СООБЩЕНИЕ:
 {incoming}"""
-    result = await _complete(_system(bot_name), prompt, FAST_MODEL, max_tokens=300)
+    result = await _complete(_system(bot_name), prompt, model=FAST_MODEL, max_tokens=300)
     return result.upper().startswith("YES")
 
 
@@ -171,7 +186,7 @@ async def chat(context, incoming, direct=False, bot_name="КПК", autonomous=Fa
 задать короткий встречный вопрос или отреагировать эмоцией — даже если к тебе
 не обращались напрямую, когда это уместно.
 Если отвечать действительно не стоит — верни ровно NO_REPLY."""
-    return await _complete(_system(bot_name), _with_image(prompt, image), MODEL)
+    return await _complete(_system(bot_name), _with_image(prompt, image))
 
 
 STICKER_RE = re.compile(r"\[STICKER:\s*([^\]]+?)\s*\]", re.I)
@@ -180,7 +195,6 @@ PHOTO_RE = re.compile(r"\[PHOTO:\s*([^\]]+?)\s*\]", re.I)
 
 
 def parse_reply(raw):
-    """-> (текст, [эмодзи стикеров], gen_prompt | None, search_query | None)"""
     raw = (raw or "").strip()
     if not raw or "NO_REPLY" in raw:
         return "", [], None, None
@@ -190,7 +204,6 @@ def parse_reply(raw):
     text = PHOTO_RE.sub("", IMG_RE.sub("", STICKER_RE.sub("", raw))).strip()
     gen_prompt = imgs[0].strip() if imgs else None
     search_query = photos[0].strip() if photos else None
-    # если оба — приоритет у реального поиска
     if search_query and gen_prompt:
         gen_prompt = None
     return text, stickers, gen_prompt, search_query
@@ -209,7 +222,7 @@ async def extract_facts(context):
     result = await _complete(
         "Ты аккуратный модуль долговременной памяти. Не выдумывай факты.",
         prompt,
-        FAST_MODEL,
+        model=FAST_MODEL,
         max_tokens=1500,
     )
     try:
