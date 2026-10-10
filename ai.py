@@ -1,21 +1,54 @@
 import base64
 import json
+import logging
 import os
 import re
+from itertools import cycle
 
 from dotenv import load_dotenv
+from openai import AsyncOpenAI, APIStatusError, RateLimitError
 
 load_dotenv()
-from openai import AsyncOpenAI
 
-# Любой OpenAI-совместимый API. По умолчанию — бесплатный Google Gemini (AI Studio).
-client = AsyncOpenAI(
-    api_key=os.environ["AI_API_KEY"],
-    base_url=os.getenv("AI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/"),
-)
+log = logging.getLogger("flow-ai-kpc")
 
-MODEL = os.getenv("AI_MODEL", "gemini-3.5-flash")
+# --- Поддержка нескольких ключей ---
+# Можно указать либо AI_API_KEYS=key1,key2,key3
+# либо старый способ AI_API_KEY=один_ключ
+_raw_keys = os.getenv("AI_API_KEYS") or os.getenv("AI_API_KEY") or ""
+API_KEYS = [k.strip() for k in _raw_keys.split(",") if k.strip()]
+
+if not API_KEYS:
+    raise RuntimeError("Не указан ни один ключ: задай AI_API_KEYS или AI_API_KEY")
+
+BASE_URL = os.getenv("AI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/")
+MODEL = os.getenv("AI_MODEL", "gemini-2.5-flash")
 FAST_MODEL = os.getenv("AI_FAST_MODEL", MODEL)
+
+# Создаём клиенты для каждого ключа
+_clients = [
+    AsyncOpenAI(api_key=key, base_url=BASE_URL)
+    for key in API_KEYS
+]
+
+# Текущий индекс (начинаем с первого)
+_current_idx = 0
+_key_cycle = cycle(range(len(_clients)))  # на всякий случай
+
+def _get_client() -> AsyncOpenAI:
+    return _clients[_current_idx]
+
+def _switch_key(reason: str = ""):
+    """Переключаемся на следующий ключ."""
+    global _current_idx
+    old = _current_idx
+    _current_idx = (_current_idx + 1) % len(_clients)
+    log.warning(
+        "Переключаю ключ %s → %s%s",
+        old + 1,
+        _current_idx + 1,
+        f" ({reason})" if reason else "",
+    )
 
 SYSTEM = """Ты — {bot_name}, живой и естественный участник Telegram-чата.
 Разговаривай естественно: замечай контекст, помни собеседников, подхватывай темы,
@@ -49,16 +82,43 @@ def _system(bot_name):
 
 
 async def _complete(system, content, model, max_tokens=1500):
-    # max_tokens с запасом: у «думающих» моделей рассуждения тоже считаются.
-    response = await client.chat.completions.create(
-        model=model,
-        max_tokens=max_tokens,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": content},
-        ],
-    )
-    return (response.choices[0].message.content or "").strip()
+    """Делает запрос. При rate-limit / 429 автоматически переключает ключ и пробует снова."""
+    last_error = None
+    attempts = len(_clients)  # максимум по одному разу на каждый ключ
+
+    for attempt in range(attempts):
+        client = _get_client()
+        try:
+            response = await client.chat.completions.create(
+                model=model,
+                max_tokens=max_tokens,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": content},
+                ],
+            )
+            return (response.choices[0].message.content or "").strip()
+
+        except (RateLimitError, APIStatusError) as e:
+            # 429 и похожие ошибки — переключаемся
+            status = getattr(e, "status_code", None) or getattr(getattr(e, "response", None), "status_code", None)
+            if status == 429 or isinstance(e, RateLimitError):
+                last_error = e
+                _switch_key(f"rate limit / {status}")
+                continue
+            # другие ошибки API — тоже пробуем следующий ключ
+            last_error = e
+            _switch_key(f"API error {status}")
+            continue
+
+        except Exception as e:
+            # неизвестная ошибка — тоже пробуем следующий
+            last_error = e
+            _switch_key(f"unexpected: {type(e).__name__}")
+            continue
+
+    # Все ключи исчерпаны
+    raise RuntimeError(f"Все {len(_clients)} ключей недоступны. Последняя ошибка: {last_error}") from last_error
 
 
 def _with_image(text, image):
